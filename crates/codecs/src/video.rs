@@ -58,8 +58,8 @@ pub trait VideoDecoder: Send {
 /// workers already decode different files in parallel.
 const BACKGROUND_H264_THREADS: usize = 2;
 
-/// NAL unit headers of a length-prefixed (avcC / hvcC) sample: the first two bytes of each unit.
-fn nal_headers(sample: &[u8], length_size: usize) -> impl Iterator<Item = (u8, u8)> + '_ {
+/// NAL units of a length-prefixed (avcC / hvcC) sample.
+fn nal_units(sample: &[u8], length_size: usize) -> impl Iterator<Item = &[u8]> + '_ {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
         if length_size == 0 || length_size > 4 || pos + length_size > sample.len() {
@@ -70,10 +70,32 @@ fn nal_headers(sample: &[u8], length_size: usize) -> impl Iterator<Item = (u8, u
         if len == 0 || pos + len > sample.len() {
             return None;
         }
-        let h = (sample[pos], if len > 1 { sample[pos + 1] } else { 0 });
+        let unit = &sample[pos..pos + len];
         pos += len;
-        Some(h)
+        Some(unit)
     })
+}
+
+/// NAL unit headers of a length-prefixed (avcC / hvcC) sample.
+fn nal_headers(sample: &[u8], length_size: usize) -> impl Iterator<Item = (u8, u8)> + '_ {
+    nal_units(sample, length_size).map(|n| (n[0], n.get(1).copied().unwrap_or(0)))
+}
+
+/// H.264 access-unit random-access check for avcC length-prefixed samples. IDR pictures are
+/// independently decodable; a recovery-point SEI with recovery_frame_cnt 0 also permits an
+/// open-GOP entry point.
+fn h264_random_access(sample: &[u8], length_size: usize) -> bool {
+    nal_units(sample, length_size).any(|n| match n.first().map(|h| h & 0x1f) {
+        Some(5) => true,
+        Some(6) => craft_media::mpegts::sei_has_recovery_point(n),
+        _ => false,
+    })
+}
+
+/// HEVC access-unit random-access check for hvcC length-prefixed samples (BLA, IDR and CRA).
+fn hevc_random_access(sample: &[u8], length_size: usize) -> bool {
+    nal_units(sample, length_size)
+        .any(|n| n.first().is_some_and(|h| (16..=21).contains(&((h >> 1) & 0x3f))))
 }
 
 /// H.264 (7.4.1): every coded slice (NAL types 1-5) of the access unit has nal_ref_idc 0.
@@ -332,15 +354,15 @@ impl VideoDecoder for H264Decoder {
         h264_disposable(sample, self.length_size)
     }
     fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
-        // Annex B samples carry their parameter sets: an IDR access unit is a starting point, and
-        // so is a non-IDR one with a recovery point SEI of recovery_frame_cnt 0 (open GOP), the
-        // same rule as the transport stream splitter's `key`.
-        (self.length_size == 0).then(|| {
+        // Annex B and avcC length-prefixed samples use the same IDR / recovery-point rule.
+        Some(if self.length_size == 0 {
             filmcraft_bitstream::annexb_nals(sample).iter().any(|n| match n.first().map(|h| h & 0x1f) {
                 Some(5) => true,
                 Some(6) => craft_media::mpegts::sei_has_recovery_point(n),
                 _ => false,
             })
+        } else {
+            h264_random_access(sample, self.length_size)
         })
     }
 }
@@ -450,10 +472,12 @@ impl VideoDecoder for HevcDecoder {
         self.dec.set_draft(on);
     }
     fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
-        // Annex B samples carry their parameter sets: an IDR / CRA / BLA access unit is a
-        // starting point.
-        (self.length_size == 0)
-            .then(|| filmcraft_bitstream::annexb_nals(sample).iter().any(|n| n.first().is_some_and(|h| (16..=21).contains(&((h >> 1) & 0x3F)))))
+        // Annex B and hvcC length-prefixed samples use the same BLA / IDR / CRA rule.
+        Some(if self.length_size == 0 {
+            filmcraft_bitstream::annexb_nals(sample).iter().any(|n| n.first().is_some_and(|h| (16..=21).contains(&((h >> 1) & 0x3f))))
+        } else {
+            hevc_random_access(sample, self.length_size)
+        })
     }
 }
 
@@ -1409,5 +1433,36 @@ mod config_fields_compat_tests {
         let mut hvcc = [0; 22];
         hvcc[21] = (3 << 3) | 2;
         assert_eq!(hvcc_length_size_and_tid(&hvcc), (3, Some(2)));
+    }
+}
+
+
+#[cfg(test)]
+mod length_prefixed_random_access_tests {
+    use super::{h264_random_access, hevc_random_access};
+
+    fn length_prefixed(nal: &[u8]) -> Vec<u8> {
+        let mut sample = (nal.len() as u32).to_be_bytes().to_vec();
+        sample.extend_from_slice(nal);
+        sample
+    }
+
+    #[test]
+    fn h264_length_prefixed_idr_is_random_access_but_p_slice_is_not() {
+        assert!(h264_random_access(&length_prefixed(&[0x65, 0x88]), 4));
+        assert!(!h264_random_access(&length_prefixed(&[0x41, 0x9a]), 4));
+    }
+
+    #[test]
+    fn hevc_length_prefixed_irap_is_random_access_but_trail_is_not() {
+        // NAL unit types 19 (IDR_W_RADL) and 1 (TRAIL_R), respectively.
+        assert!(hevc_random_access(&length_prefixed(&[19 << 1, 1]), 4));
+        assert!(!hevc_random_access(&length_prefixed(&[1 << 1, 1]), 4));
+    }
+
+    #[test]
+    fn length_prefixed_random_access_rejects_empty_or_truncated_units() {
+        assert!(!h264_random_access(&[0, 0, 0, 2, 0x65], 4));
+        assert!(!hevc_random_access(&[0, 0, 0, 0], 4));
     }
 }
