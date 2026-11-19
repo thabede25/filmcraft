@@ -84,7 +84,7 @@ fn nal_headers(sample: &[u8], length_size: usize) -> impl Iterator<Item = (u8, u
 /// H.264 access-unit random-access check for avcC length-prefixed samples. IDR pictures are
 /// independently decodable; a recovery-point SEI with recovery_frame_cnt 0 also permits an
 /// open-GOP entry point.
-fn h264_random_access(sample: &[u8], length_size: usize) -> bool {
+pub(crate) fn h264_random_access(sample: &[u8], length_size: usize) -> bool {
     nal_units(sample, length_size).any(|n| match n.first().map(|h| h & 0x1f) {
         Some(5) => true,
         Some(6) => craft_media::mpegts::sei_has_recovery_point(n),
@@ -93,7 +93,7 @@ fn h264_random_access(sample: &[u8], length_size: usize) -> bool {
 }
 
 /// HEVC access-unit random-access check for hvcC length-prefixed samples (BLA, IDR and CRA).
-fn hevc_random_access(sample: &[u8], length_size: usize) -> bool {
+pub(crate) fn hevc_random_access(sample: &[u8], length_size: usize) -> bool {
     nal_units(sample, length_size)
         .any(|n| n.first().is_some_and(|h| (16..=21).contains(&((h >> 1) & 0x3f))))
 }
