@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use filmcraft_isobmff::{CodecConfig, SampleEntry};
 
 pub use crate::hw_frame::{FrameCodec, FrameStreamInfo, PictureParams};
-use crate::video::{avcc_length_size, h264_disposable, hevc_disposable, hvcc_length_size_and_tid, sar_par, vui_color};
+use crate::video::{avcc_length_size, h264_disposable, h264_random_access, hevc_disposable, hevc_random_access, hvcc_length_size_and_tid, sar_par, vui_color};
 use crate::{CodecError, Result};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -367,16 +367,15 @@ impl NalStreamInfo {
     /// Whether decoding can restart at `sample` with no earlier state: an IDR access unit (H.264)
     /// or an IRAP one (HEVC IDR / CRA / BLA).
     pub fn is_irap(&self, sample: &[u8]) -> bool {
-        self.nal_types(sample).iter().any(|&t| match self.codec {
-            NalCodec::H264 => t == 5,
-            NalCodec::Hevc => (16..=23).contains(&t),
-        })
+        match self.codec {
+            NalCodec::H264 => h264_random_access(sample, self.length_size),
+            NalCodec::Hevc => hevc_random_access(sample, self.length_size),
+        }
     }
 
-    /// As the software decoder's [`crate::VideoDecoder::is_random_access`] for this stream
-    /// (length-prefixed samples: unknown, the container's sync flags are trusted).
-    pub fn is_random_access(&self, _sample: &[u8]) -> Option<bool> {
-        None
+    /// As the software decoder's [`crate::VideoDecoder::is_random_access`] for this stream.
+    pub fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
+        Some(self.is_irap(sample))
     }
 
     /// As the software decoder's [`crate::VideoDecoder::is_disposable`] for this stream.
